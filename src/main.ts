@@ -2,7 +2,9 @@ import { MarkdownView, Plugin } from "obsidian";
 import { EditorView } from "@codemirror/view";
 import { toggleFold } from "@codemirror/language";
 
-const DOUBLE_CLICK_MS = 350;
+const DOUBLE_CLICK_MS = 400;
+const TAP_MAX_DURATION_MS = 300;
+const TAP_MAX_MOVE_PX = 10;
 
 export default class HeadingClickFoldPlugin extends Plugin {
 	private lastHeading: {
@@ -11,14 +13,52 @@ export default class HeadingClickFoldPlugin extends Plugin {
 		at: number;
 	} | null = null;
 
+	private pointerStart: {
+		x: number;
+		y: number;
+		time: number;
+		pointerId: number;
+	} | null = null;
+
 	async onload() {
 		this.registerDomEvent(document, "pointerdown", this.onPointerDown, true);
+		this.registerDomEvent(document, "pointerup", this.onPointerUp, true);
+		this.registerDomEvent(document, "pointercancel", this.onPointerCancel, true);
 	}
 
-	private onPointerDown = (event: PointerEvent) => {
-		// Only primary mouse button. Touch/stylus are left to Obsidian's normal behavior.
-		if (event.button !== 0 || event.pointerType !== "mouse") return;
+	private onPointerCancel = () => {
+		this.pointerStart = null;
+	};
 
+	private onPointerDown = (event: PointerEvent) => {
+		// Accept mouse, touch, and pen. Only primary button for mouse.
+		if (event.pointerType === "mouse" && event.button !== 0) return;
+
+		this.pointerStart = {
+			x: event.clientX,
+			y: event.clientY,
+			time: performance.now(),
+			pointerId: event.pointerId
+		};
+	};
+
+	private onPointerUp = (event: PointerEvent) => {
+		const start = this.pointerStart;
+		this.pointerStart = null;
+		if (!start || start.pointerId !== event.pointerId) return;
+
+		const duration = performance.now() - start.time;
+		const dx = Math.abs(event.clientX - start.x);
+		const dy = Math.abs(event.clientY - start.y);
+
+		// Must be a quick tap with minimal movement (so scrolling isn't hijacked).
+		if (duration > TAP_MAX_DURATION_MS) return;
+		if (dx > TAP_MAX_MOVE_PX || dy > TAP_MAX_MOVE_PX) return;
+
+		this.handleTap(event);
+	};
+
+	private handleTap(event: PointerEvent) {
 		const target = event.target;
 		if (!(target instanceof Element)) return;
 
@@ -31,8 +71,7 @@ export default class HeadingClickFoldPlugin extends Plugin {
 		const editorEl = markdownView.containerEl.querySelector(".cm-editor");
 		if (!editorEl || !editorEl.contains(cm)) return;
 
-		// @ts-expect-error Obsidian exposes the CodeMirror 6 editor as view.editor.cm,
-		// but it isn't currently typed by the public API.
+		// @ts-expect-error Obsidian exposes the CodeMirror 6 editor as view.editor.cm
 		const view = markdownView.editor.cm as EditorView;
 		if (!view || !view.dom.contains(target)) return;
 
@@ -52,7 +91,7 @@ export default class HeadingClickFoldPlugin extends Plugin {
 			this.lastHeading.lineFrom === line.from &&
 			performance.now() - this.lastHeading.at <= DOUBLE_CLICK_MS;
 
-		// Prevent the first click from placing the cursor in the heading.
+		// Prevent the tap from placing the cursor in the heading.
 		event.preventDefault();
 		event.stopPropagation();
 
@@ -68,9 +107,9 @@ export default class HeadingClickFoldPlugin extends Plugin {
 			at: performance.now()
 		};
 
-		// Toggle immediately on the first click.
+		view.dispatch({ selection: { anchor: line.from } });
 		toggleFold(view);
-	};
+	}
 
 	private editHeading(
 		view: EditorView,
@@ -79,8 +118,6 @@ export default class HeadingClickFoldPlugin extends Plugin {
 		textStart: number
 	) {
 		const text = view.state.doc.sliceString(textStart, lineTo);
-
-		// Remove optional closing # characters only when they are separated by whitespace.
 		const cleaned = text.replace(/\s+#+\s*$/, "");
 		const end = textStart + cleaned.length;
 
